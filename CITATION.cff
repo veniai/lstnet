@@ -1,0 +1,24 @@
+cff-version: 1.2.0
+message: "If you use lstnet in your research, please cite it as below."
+title: "lstnet: a pure-Python land surface temperature ground-validation library"
+abstract: >-
+  lstnet computes ground-truth land surface temperature (LST) from in-situ
+  longwave radiation at SURFRAD / PKULSTNet / HiWATER sites and validates it
+  against retrieved LST (bias / RMSE / R + plots). GDAL-free, cross-platform.
+authors:
+  - family-names: "LSTNet"
+    given-names: "Contributors"
+    email: ""
+  - name: "LSTNet Contributors"
+keywords:
+  - land surface temperature
+  - LST
+  - validation
+  - MODIS
+  - SURFRAD
+  - remote sensing
+  - broadband emissivity
+license: MIT
+version: 0.1.0
+date-released: "2026-06-20"
+repository-code: "https://github.com/veniai/lstnet"

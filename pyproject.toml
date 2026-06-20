@@ -1,0 +1,39 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "lstnet"
+version = "0.1.0"
+description = "LSTNet: pure-Python land surface temperature library (ground truth LST production refactor)."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+license-files = ["LICENSE"]
+authors = [{ name = "LSTNet Contributors" }]
+dependencies = [
+    "numpy",
+    "pandas",
+    "openpyxl",
+    "requests",
+    "earthaccess",
+    "pyhdf",
+    "astral",
+    "matplotlib",
+    "h5py",
+    "rasterio",
+    "PySide6",
+    "fastmcp",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+]
+
+[project.scripts]
+lstnet-gui = "lstnet.gui:main"
+lstnet-mcp = "lstnet.mcp_server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/lstnet"]

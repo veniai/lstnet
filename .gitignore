@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# PyInstaller build artifacts
+build/
+dist/
+
+# Observation / satellite data (large; obtained separately, not version-controlled)
+# Small test fixtures live in tests/fixtures/
+data/
+
+# IDE
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets / personal
+.env
+CLAUDE.local.md
+
+# Logs
+*.log
