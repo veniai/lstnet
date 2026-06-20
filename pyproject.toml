@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "lstnet"
-version = "0.1.0"
+version = "0.2.0"
 description = "LSTNet: pure-Python land surface temperature library (ground truth LST production refactor)."
 readme = "README.md"
 requires-python = ">=3.9"

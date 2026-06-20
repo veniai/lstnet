@@ -6,7 +6,7 @@ satellite overpass times and validating it against retrieved LST.
 """
 from __future__ import annotations
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 from lstnet.dayornight import dayornight
 from lstnet.ground_lst import SIGMA, compute_ground_lst, lst_from_radiance

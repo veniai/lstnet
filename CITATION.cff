@@ -19,6 +19,6 @@ keywords:
   - remote sensing
   - broadband emissivity
 license: MIT
-version: 0.1.0
-date-released: "2026-06-20"
+version: 0.2.0
+date-released: "2026-06-21"
 repository-code: "https://github.com/veniai/lstnet"
