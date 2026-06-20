@@ -2,8 +2,28 @@
 from __future__ import annotations
 
 import os
+import time
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+
+def _drain_worker(app, win, timeout=5.0):
+    """Wait for the active GUI worker thread to finish and flush its signals.
+
+    ``_compute``/``_validate`` run on a :class:`QThread`; the table/stats update
+    happens in the ``finished`` slot, which only runs once the main-thread event
+    loop processes the queued signal. Tests must drain the loop after kicking the
+    worker, or they race the async result (and a Validate-then-Export sequence
+    would hit the "nothing to export" modal dialog while the worker is mid-flight).
+    """
+    deadline = time.monotonic() + timeout
+    while win._worker is not None:
+        worker = win._worker
+        worker.wait(100)  # block up to 100ms for run() to return
+        app.processEvents()  # deliver the queued finished signal -> _worker=None
+        if time.monotonic() > deadline:
+            raise AssertionError("GUI worker did not finish within timeout")
+
 
 
 def test_gui_window_constructs_with_25_sites():
@@ -67,6 +87,7 @@ def test_gui_compute_drives_compute_through_widgets(monkeypatch):
     win.times_edit.setPlainText("202007141413")
     win.emiss_combo.setCurrentIndex(0)  # Fixed 0.95
     win._compute()
+    _drain_worker(app, win)
     assert win.table.rowCount() == 1
     assert win.table.item(0, 0).text() == "202007141413"
     assert win.table.item(0, 2).text() == "280.000"
@@ -125,6 +146,7 @@ def test_compute_passes_data_dir_to_reader(monkeypatch, tmp_path):
             win.site_list.item(i).setCheckState(Qt.Checked)
     win.times_edit.setPlainText("202007141413")
     win._compute()
+    _drain_worker(app, win)
     assert seen["data_dir"] == str(tmp_path / "mydata" / "SURFRAD")
 
 
@@ -291,6 +313,7 @@ def test_validate_shows_progress_feedback_then_restores_button(tmp_path, monkeyp
     win._retr_path = str(csv_path)
     win.validate_btn.setEnabled(True)
     win._validate()
+    _drain_worker(app, win)
     # mid-computation: button said "Validating…" and was disabled, status showed progress
     assert seen.get("mid_text") == "Validating…"
     assert seen.get("mid_enabled") is False
@@ -331,6 +354,7 @@ def test_validate_is_self_contained_and_enriches_table(tmp_path, monkeypatch):
     win._retr_path = str(csv_path)
     win.validate_btn.setEnabled(True)
     win._validate()
+    _drain_worker(app, win)
 
     # table reconfigured to 6 paired columns
     assert win.table.columnCount() == 7
@@ -374,6 +398,7 @@ def test_export_after_validate_writes_paired_columns(tmp_path, monkeypatch):
     win = LSTNetWindow()
     win._retr_path = str(csv_path)
     win._validate()
+    _drain_worker(app, win)  # finish before export, else the empty-result modal hangs
     win._export()
 
     text = out.read_text()
@@ -410,11 +435,13 @@ def test_compute_then_validate_reconfigures_table(monkeypatch, tmp_path):
             win.site_list.item(i).setCheckState(Qt.Checked)
     win.times_edit.setPlainText("202007141413")
     win._compute()
+    _drain_worker(app, win)
     assert win.table.columnCount() == 5
     assert win._last_mode == "ground"
     # right validate (independent) — table switches to 6 cols
     win._retr_path = str(csv_path)
     win._validate()
+    _drain_worker(app, win)
     assert win.table.columnCount() == 7
     assert win._last_mode == "validation"
 

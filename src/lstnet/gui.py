@@ -15,7 +15,7 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -43,7 +43,7 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
 from lstnet import config
-from lstnet import FixedEmissivity, compute_ground_lst, validate
+from lstnet import FixedEmissivity, __version__, compute_ground_lst, validate
 from lstnet.io.hiwater import HiwaterReader
 from lstnet.io.pku import PkuReader
 from lstnet.io.surfrad import SurfradReader
@@ -57,7 +57,117 @@ _NETWORKS = ("SURFRAD", "PKULSTNet", "HiWATER")
 # different data root we anchor each reader at ``<data_root>/<subdir>`` so the
 # on-disk layout is preserved.
 _NETWORK_SUBDIR = {"SURFRAD": "SURFRAD", "PKULSTNet": "pku-sites", "HiWATER": "HiWATER"}
+# One-line hint for where/how each network's data lands. Shown in the network
+# checkbox tooltip, the status bar on toggle, and the folder README.
+_NETWORK_DATA_HINT = {
+    "SURFRAD": "auto-downloaded from NOAA (online; needs network)",
+    "PKULSTNet": "place CR200 .dat files here (hbc/hnw/hnh/xzl/imb/xjf/cqb)",
+    "HiWATER": "place <year>/*.xlsx workbooks here (UL_Cor/DL_Cor columns)",
+}
+# Per-column pixel widths keyed by table mode. Site stays narrow, Time wide;
+# the last column always stretches to fill the panel.
+_TABLE_WIDTHS = {
+    "loaded": (95, 135, 130),
+    "ground": (135, 95, 110, 90, 90),
+    "validation": (95, 135, 110, 110, 90, 75, 90),
+}
 _EARTHDATA_FILE = Path.home() / ".lstnet" / "earthdata.json"
+
+
+# ---------------------------------------------------------------------------
+# Background workers — heavy computation runs off the GUI thread so the window
+# never shows "Not Responding" while SURFRAD/MODIS downloads are in flight.
+# Each worker emits its result via a Qt signal; the main thread updates the
+# table/labels/canvas only from the connected slot (never from run()).
+# ---------------------------------------------------------------------------
+
+
+class _ComputeWorker(QThread):
+    """Runs the ground-LST computation loop off the GUI thread.
+
+    Captures only plain-Python inputs (no Qt widgets) and emits the resulting
+    list of :class:`GroundLST`. The main thread wires ``finished`` to the
+    table/stats update and ``error`` to a status-bar message.
+    """
+
+    finished = Signal(list)
+    error = Signal(str)
+
+    def __init__(self, sites, tokens, emiss_src, data_folder):
+        super().__init__()
+        self.site_time_pairs = [(s, None) for s in sites]
+        self.tokens = tokens
+        self.emiss_src = emiss_src
+        self.data_folder = data_folder
+
+    def run(self):
+        try:
+            results = _compute_ground_loop(
+                self.site_time_pairs, self.tokens, self.emiss_src, self.data_folder
+            )
+            self.finished.emit(results)
+        except Exception as e:  # noqa: BLE001 — surface any failure to the UI
+            self.error.emit(str(e))
+
+
+class _ValidateWorker(QThread):
+    """Runs ground-LST computation + validation off the GUI thread.
+
+    Emits the resulting :class:`ValidationResult`. Stats/plot updates happen
+    on the main thread via the connected slot.
+    """
+
+    finished = Signal(object)
+    error = Signal(str)
+
+    def __init__(self, retr_items, emiss_src, data_folder):
+        super().__init__()
+        self.retr_items = retr_items
+        self.emiss_src = emiss_src
+        self.data_folder = data_folder
+
+    def run(self):
+        try:
+            ground = _compute_ground_loop(
+                [(r.site, r.overpass_time) for r in self.retr_items],
+                None,
+                self.emiss_src,
+                self.data_folder,
+            )
+            result = validate(ground, self.retr_items)
+            self.finished.emit(result)
+        except Exception as e:  # noqa: BLE001
+            self.error.emit(str(e))
+
+
+def _compute_ground_loop(site_time_pairs, tokens, emiss_src, data_folder):
+    """Pure (non-Qt) ground-LST computation loop shared by both workers.
+
+    ``site_time_pairs`` is always a list of ``(site, datetime|None)`` tuples.
+    When ``datetime`` is ``None`` the matching ``tokens`` are expanded — every
+    (site, token) combination is computed (the left-Compute path). When a
+    concrete datetime is supplied, that single (site, time) is computed and
+    ``tokens`` is ignored (the right-Validate path).
+    """
+    results: list = []
+    for site, t_fixed in site_time_pairs:
+        subdir = _NETWORK_SUBDIR.get(site.network, "")
+        reader_data_dir = (
+            str(Path(data_folder) / subdir) if subdir else data_folder
+        )
+        reader = _READERS[site.network](data_dir=reader_data_dir)
+        time_list = [t_fixed] if t_fixed is not None else (
+            datetime.strptime(tok, "%Y%m%d%H%M").replace(tzinfo=timezone.utc)
+            for tok in (tokens or [])
+        )
+        for t in time_list:
+            try:
+                g = compute_ground_lst(site, t, emiss_src, reader)
+            except (ValueError, Exception):
+                continue
+            if g is not None:
+                results.append(g)
+    return results
 
 
 class LSTNetWindow(QMainWindow):
@@ -67,17 +177,25 @@ class LSTNetWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("LSTNet — LST validation")
+        self.setWindowTitle(f"LSTNet v{__version__} — LST validation")
         self.resize(1180, 780)
         self._ground: list = []
         self._validation_pairs: list = []
         self._last_mode: str | None = None  # "ground" | "validation"
         self._unmatched_summary: str = ""
         self._retr_path: str | None = None
-        self.data_folder: str = str(config.project_root() / "data")
+        # PyInstaller bundles the package under _MEIPASS, so project_root()
+        # points inside the bundle — there is no user data there. Default to
+        # the current working directory instead (where the exe is launched).
+        if getattr(sys, "frozen", False):
+            self.data_folder: str = str(Path.cwd())
+        else:
+            self.data_folder = str(config.project_root() / "data")
+        self._worker: QThread | None = None  # active background worker, if any
         self._load_earthdata_env()
         self._build_ui()
         self._populate_sites()
+        self._ensure_data_subdirs()
         self._update_available.connect(self._on_update_available)
         threading.Thread(target=self._check_update, daemon=True).start()
 
@@ -127,8 +245,8 @@ class LSTNetWindow(QMainWindow):
         left = QWidget()
         lv = QVBoxLayout(left)
 
-        self.update_label = QLabel("")
-        self.update_label.setHidden(True)
+        self.update_label = QLabel(f"LSTNet v{__version__}")
+        self.update_label.setStyleSheet("color: #555; font-size: 11px;")
         lv.addWidget(self.update_label)
 
         data_grp = QGroupBox("Data folder")
@@ -152,7 +270,10 @@ class LSTNetWindow(QMainWindow):
         for net in _NETWORKS:
             cb = QCheckBox(net)
             cb.setChecked(True)
-            cb.toggled.connect(self._populate_sites)
+            cb.setToolTip(
+                f"Data: <root>/{_NETWORK_SUBDIR[net]} — {_NETWORK_DATA_HINT[net]}"
+            )
+            cb.toggled.connect(lambda _checked, n=net: self._on_network_toggled(n))
             self.net_checks[net] = cb
             ng.addWidget(cb)
         ng.addStretch()
@@ -211,7 +332,9 @@ class LSTNetWindow(QMainWindow):
         rv.addWidget(QLabel("Ground-truth LST"))
         self.table = QTableWidget(0, 5)
         self.table.setHorizontalHeaderLabels(["Time", "Site", "LST (K)", "Emiss", "QC"])
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        # Default to Interactive; per-mode widths are applied when results load
+        # (see _apply_column_widths) so Site stays narrow and Time stays wide.
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         rv.addWidget(self.table)
 
         row2 = QHBoxLayout()
@@ -228,11 +351,15 @@ class LSTNetWindow(QMainWindow):
         vr = QHBoxLayout()
         b_load = QPushButton("Load retrieved CSV…")
         b_load.clicked.connect(self._load_retrieved)
+        b_format = QPushButton("Format…")
+        b_format.setToolTip("Show the required retrieved-LST CSV format + save a template")
+        b_format.clicked.connect(self._show_csv_help)
         self.retr_label = QLabel("no file")
         self.validate_btn = QPushButton("Validate")
         self.validate_btn.setEnabled(False)  # enabled once a valid CSV is loaded
         self.validate_btn.clicked.connect(self._validate)
         vr.addWidget(b_load)
+        vr.addWidget(b_format)
         vr.addWidget(self.retr_label, 1)
         vr.addWidget(self.validate_btn)
         vg.addLayout(vr)
@@ -257,6 +384,7 @@ class LSTNetWindow(QMainWindow):
         if path:
             self.data_folder = path
             self.data_folder_edit.setText(path)
+            self._ensure_data_subdirs()
             self.status.showMessage(f"Data folder: {path}", 5000)
 
     @staticmethod
@@ -355,6 +483,80 @@ class LSTNetWindow(QMainWindow):
             it.setCheckState(Qt.Unchecked)
             self.site_list.addItem(it)
 
+    # --- data folders (pre-create + instructions) ---------------------------
+
+    def _on_network_toggled(self, net):
+        """Rebuild the site list and, when enabled, make the data subdir exist."""
+        self._populate_sites()
+        if self.net_checks[net].isChecked():
+            created, path = self._ensure_data_subdir(net)
+            hint = _NETWORK_DATA_HINT.get(net, "")
+            if created:
+                self.status.showMessage(f"Created {path} — {hint}", 8000)
+            else:
+                self.status.showMessage(f"{net} data folder: {path}", 5000)
+
+    def _ensure_data_subdirs(self):
+        """Create the data subdir for every checked network (mkdir -p)."""
+        for net, cb in self.net_checks.items():
+            if cb.isChecked():
+                self._ensure_data_subdir(net)
+
+    def _ensure_data_subdir(self, net):
+        """Create ``<data_folder>/<subdir>`` and, for PKU/HiWATER, a README.
+
+        Returns ``(created_now, path_str)``. ``created_now`` is True when the
+        directory did not exist before this call (so the caller can announce it).
+        """
+        subdir = _NETWORK_SUBDIR.get(net)
+        if not subdir:
+            return False, self.data_folder
+        path = Path(self.data_folder) / subdir
+        created = not path.exists()
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return False, str(path)
+        self._write_data_readme(net, path)
+        return created, str(path)
+
+    @staticmethod
+    def _write_data_readme(net, path):
+        """Drop a one-file hint describing what to place in PKU/HiWATER folders.
+
+        SURFRAD is online, so it gets no README (nothing for the user to place).
+        Idempotent — never overwrites an existing README.
+        """
+        bodies = {
+            "PKULSTNet": (
+                "PKULSTNet ground data\n"
+                "=====================\n\n"
+                "Place Campbell CR200Series .dat files here (comma-delimited,\n"
+                "4-line header), one per site, named after the site code:\n"
+                "  hbc.dat  hnw.dat  hnh.dat  xzl.dat  imb.dat  xjf.dat  cqb.dat\n\n"
+                "Each file must contain TagTemp_C_Avg(1) and TagTemp_C_Avg(2)\n"
+                "brightness-temperature columns.\n"
+            ),
+            "HiWATER": (
+                "HiWATER ground data\n"
+                "===================\n\n"
+                "Place yearly .xlsx workbooks under a per-year subfolder:\n"
+                "  <year>/<year>年黑河流域地表过程综合观测网<中文名>AWS.xlsx\n\n"
+                "Workbooks must contain UL_Cor / DL_Cor longwave columns (W/m^2)\n"
+                "at 10-minute intervals.\n"
+            ),
+        }
+        body = bodies.get(net)
+        if not body:
+            return
+        readme = path / "README.txt"
+        if readme.exists():
+            return
+        try:
+            readme.write_text(body, encoding="utf-8")
+        except OSError:
+            pass
+
     def _set_all_sites(self, on):
         state = Qt.Checked if on else Qt.Unchecked
         for i in range(self.site_list.count()):
@@ -392,29 +594,53 @@ class LSTNetWindow(QMainWindow):
         return FixedEmissivity(0.95)
 
     def _compute(self):
+        if self._worker is not None and self._worker.isRunning():
+            self.status.showMessage("Busy — wait for the current job to finish", 3000)
+            return
         sites = self._selected_sites()
         tokens = self.times_edit.toPlainText().split()
         if not sites or not tokens:
             QMessageBox.warning(self, "注意", "请先选站点并输入过境时间")
             return
-        emiss = self._emissivity_source()
+        try:
+            emiss = self._emissivity_source()
+        except (ValueError, OSError) as e:
+            QMessageBox.warning(self, "注意", f"发射率配置无效:\n{e}")
+            return
         self._ground = []
+        self.compute_btn.setText("Computing…")
+        self.compute_btn.setEnabled(False)
+        self.settings_btn.setEnabled(False)
         self.status.showMessage("Computing… (network sources may download data)")
-        QApplication.processEvents()
-        for site in sites:
-            subdir = _NETWORK_SUBDIR.get(site.network, "")
-            reader_data_dir = str(Path(self.data_folder) / subdir) if subdir else self.data_folder
-            reader = _READERS[site.network](data_dir=reader_data_dir)
-            for tok in tokens:
-                try:
-                    t = datetime.strptime(tok, "%Y%m%d%H%M").replace(tzinfo=timezone.utc)
-                    g = compute_ground_lst(site, t, emiss, reader)
-                except (ValueError, Exception):
-                    continue
-                if g is not None:
-                    self._ground.append(g)
-        self._show_ground_results(self._ground)
-        self.status.showMessage(f"Done — {len(self._ground)} ground-LST values", 5000)
+        self._worker = _ComputeWorker(sites, tokens, emiss, self.data_folder)
+        self._worker.finished.connect(self._on_compute_done)
+        self._worker.error.connect(self._on_worker_error)
+        self._worker.start()
+
+    def _on_compute_done(self, results):
+        self._show_ground_results(results)
+        self.status.showMessage(
+            f"Done — {len(self._ground)} ground-LST values", 5000
+        )
+        self._finish_worker()
+        self.compute_btn.setText("Compute ground LST")
+        self.compute_btn.setEnabled(True)
+        self.settings_btn.setEnabled(True)
+
+    def _on_worker_error(self, message):
+        self.status.showMessage(f"Error: {message}", 8000)
+        self._finish_worker()
+        self.compute_btn.setText("Compute ground LST")
+        self.compute_btn.setEnabled(True)
+        self.validate_btn.setText("Validate")
+        self.validate_btn.setEnabled(bool(self._retr_path))
+        self.settings_btn.setEnabled(True)
+
+    def _finish_worker(self):
+        """Drop the worker reference so the next job can start (and let Qt GC it)."""
+        if self._worker is not None:
+            self._worker.deleteLater()
+        self._worker = None
 
     # --- results table (reconfigures columns per last operation) ------------
 
@@ -437,6 +663,7 @@ class LSTNetWindow(QMainWindow):
             ]
             for c, text in enumerate(cells):
                 self.table.setItem(r, c, QTableWidgetItem(text))
+        self._apply_column_widths(self._last_mode)
 
     def _show_ground_results(self, ground_list):
         """Left-Compute result: 5 columns of ground-truth LST only."""
@@ -455,6 +682,7 @@ class LSTNetWindow(QMainWindow):
             ]
             for c, text in enumerate(cells):
                 self.table.setItem(r, c, QTableWidgetItem(text))
+        self._apply_column_widths(self._last_mode)
 
     def _show_validation_results(self, result):
         """Right-Validate result: 7 columns — paired retrieved/ground LST + emissivity."""
@@ -482,6 +710,21 @@ class LSTNetWindow(QMainWindow):
             ]
             for c, text in enumerate(cells):
                 self.table.setItem(r, c, QTableWidgetItem(text))
+        self._apply_column_widths(self._last_mode)
+
+    def _apply_column_widths(self, mode):
+        """Set per-column widths for the current table mode; stretch the last.
+
+        Site is kept narrow, Time wide; the trailing column absorbs spare width
+        so the table fills the panel without squashing the value columns.
+        """
+        widths = _TABLE_WIDTHS.get(mode)
+        if not widths:
+            return
+        header = self.table.horizontalHeader()
+        for i, w in enumerate(widths):
+            self.table.setColumnWidth(i, w)
+        header.setSectionResizeMode(len(widths) - 1, QHeaderView.Stretch)
 
     def _clear_ground(self):
         self._ground = []
@@ -584,7 +827,46 @@ class LSTNetWindow(QMainWindow):
         present = {h.strip() for h in header}
         return required - present
 
+    def _show_csv_help(self):
+        """Explain the retrieved-LST CSV format and offer to save a template."""
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Information)
+        msg.setWindowTitle("Retrieved-LST CSV format")
+        msg.setText(
+            "Required columns (header row, any order; extra columns ignored):\n"
+            "    site, overpass_time_utc, lst_k\n\n"
+            "Example:\n"
+            "    site,overpass_time_utc,lst_k\n"
+            "    psu,201202121430,295.32\n"
+            "    tbl,201202130230,288.71\n\n"
+            "• site             — matches a site code in the Sites list\n"
+            "• overpass_time_utc — YYYYMMDDHHMM, UTC\n"
+            "• lst_k            — retrieved LST in Kelvin"
+        )
+        save = msg.addButton("Save template…", QMessageBox.AcceptRole)
+        msg.addButton("Close", QMessageBox.RejectRole)
+        msg.exec()
+        if msg.clickedButton() is save:
+            self._save_template_csv()
+
+    def _save_template_csv(self):
+        """Write a minimal retrieved-LST template the user can fill in."""
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save retrieved-LST template", "retrieved_template.csv", "CSV (*.csv)"
+        )
+        if not path:
+            return
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["site", "overpass_time_utc", "lst_k"])
+            w.writerow(["psu", "201202121430", "295.32"])
+            w.writerow(["tbl", "201202130230", "288.71"])
+        self.status.showMessage(f"Saved template: {path}", 5000)
+
     def _validate(self):
+        if self._worker is not None and self._worker.isRunning():
+            self.status.showMessage("Busy — wait for the current job to finish", 3000)
+            return
         if not self._retr_path:
             QMessageBox.warning(self, "注意", "请先载入反演 CSV")
             return
@@ -593,58 +875,54 @@ class LSTNetWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "错误", f"读取反演 CSV 失败:\n{e}")
             return
-        emiss = self._emissivity_source()
-        ground = []
+        try:
+            emiss = self._emissivity_source()
+        except (ValueError, OSError) as e:
+            QMessageBox.warning(self, "注意", f"发射率配置无效:\n{e}")
+            return
         # Obvious progress feedback: disable + relabel the button and tell the
         # status bar how many rows are being processed, so the user knows the
         # (potentially slow, network-bound) computation has started.
         self.validate_btn.setText("Validating…")
         self.validate_btn.setEnabled(False)
+        self.compute_btn.setEnabled(False)
         self.status.showMessage(
             f"Validating — computing ground LST for {len(retr)} sites…"
         )
-        QApplication.processEvents()
-        try:
-            for r in retr:
-                subdir = _NETWORK_SUBDIR.get(r.site.network, "")
-                reader_data_dir = (
-                    str(Path(self.data_folder) / subdir) if subdir else self.data_folder
-                )
-                reader = _READERS[r.site.network](data_dir=reader_data_dir)
-                try:
-                    g = compute_ground_lst(r.site, r.overpass_time, emiss, reader)
-                except (ValueError, Exception):
-                    continue
-                if g is not None:
-                    ground.append(g)
-            result = validate(ground, retr)
-            s = result.stats
-            self._show_validation_results(result)
-            self.stats_label.setText(
-                f"n={s.n}   bias={s.bias:+.3f} K   RMSE={s.rmse:.3f} K   R={s.r:.3f}"
-                f"   ({self._unmatched_summary})"
-            )
-            self.fig.clear()
-            ax = self.fig.add_subplot(111)
-            if result.pairs:
-                x = [p.ground.lst_k for p in result.pairs]
-                y = [p.retrieved.lst_k for p in result.pairs]
-                ax.scatter(x, y)
-                lo, hi = min(min(x), min(y)), max(max(x), max(y))
-                ax.plot([lo, hi], [lo, hi], "r--", label="1:1")
-                ax.legend()
-            ax.set_xlabel("Ground LST (K)")
-            ax.set_ylabel("Retrieved LST (K)")
-            ax.set_title("Retrieved vs Ground")
-            self.fig.tight_layout()
-            self.canvas.draw()
-            self.status.showMessage(
-                f"Validated {s.n} pairs (bias={s.bias:+.3f}, RMSE={s.rmse:.3f}, R={s.r:.3f})",
-                5000,
-            )
-        finally:
-            self.validate_btn.setText("Validate")
-            self.validate_btn.setEnabled(True)
+        self._worker = _ValidateWorker(retr, emiss, self.data_folder)
+        self._worker.finished.connect(self._on_validate_done)
+        self._worker.error.connect(self._on_worker_error)
+        self._worker.start()
+
+    def _on_validate_done(self, result):
+        s = result.stats
+        self._show_validation_results(result)
+        self.stats_label.setText(
+            f"n={s.n}   bias={s.bias:+.3f} K   RMSE={s.rmse:.3f} K   R={s.r:.3f}"
+            f"   ({self._unmatched_summary})"
+        )
+        self.fig.clear()
+        ax = self.fig.add_subplot(111)
+        if result.pairs:
+            x = [p.ground.lst_k for p in result.pairs]
+            y = [p.retrieved.lst_k for p in result.pairs]
+            ax.scatter(x, y)
+            lo, hi = min(min(x), min(y)), max(max(x), max(y))
+            ax.plot([lo, hi], [lo, hi], "r--", label="1:1")
+            ax.legend()
+        ax.set_xlabel("Ground LST (K)")
+        ax.set_ylabel("Retrieved LST (K)")
+        ax.set_title("Retrieved vs Ground")
+        self.fig.tight_layout()
+        self.canvas.draw()
+        self.status.showMessage(
+            f"Validated {s.n} pairs (bias={s.bias:+.3f}, RMSE={s.rmse:.3f}, R={s.r:.3f})",
+            5000,
+        )
+        self._finish_worker()
+        self.validate_btn.setText("Validate")
+        self.validate_btn.setEnabled(True)
+        self.compute_btn.setEnabled(True)
 
 
 def main():
